@@ -110,13 +110,8 @@ Imagine you have a vector `v = [v1, v2, v3, v4]` at position `m`. RoPE groups th
 
 **Step 2: The Rotation Mathematics**
 
-For a pair of features `(x, y)` from a vector at position `m`, RoPE applies a rotation. The formula, expressed in matrix form, is:
+For a pair of features `(x, y)` from a vector at position `m`, RoPE applies a rotation. The formulas for this are:
 
-\[
-\begin{pmatrix} x' \\ y' \end{pmatrix} = \begin{pmatrix} \cos(\theta_m) & -\sin(\theta_m) \\ \sin(\theta_m) & \cos(\theta_m) \end{pmatrix} \begin{pmatrix} x \\ y \end{pmatrix}
-\]
-
-This is equivalent to:
 - `x' = x * cos(θ_m) - y * sin(θ_m)`
 - `y' = x * sin(θ_m) + y * cos(θ_m)`
 
@@ -305,11 +300,9 @@ The output of the attention mechanism is added to the original input `X` (a resi
 **RMSNorm (Root Mean Square Normalization)**
 RMSNorm is a simpler and faster alternative to LayerNorm.
 
-The formula is:
-\[
-\text{RMSNorm}(x) = \frac{x}{\sqrt{\text{mean}(x^2) + \epsilon}} \cdot g
-\]
-where `x` is a token's vector, `g` is a learnable gain parameter, and `\epsilon` is a small value for stability.
+The formula is: `RMSNorm(x) = (x / sqrt(mean(x*x) + epsilon)) * g`
+
+where `x` is a token's vector, `g` is a learnable gain parameter, and `epsilon` is a small value for stability.
 
 Let's apply it to a single vector `v = [2, 3, -1, 4]` from our `X_after_attn` matrix.
 
