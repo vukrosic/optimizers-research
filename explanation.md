@@ -384,3 +384,50 @@ Finally, to predict the next token, we apply a linear layer (the "LM Head") to o
 `Logits = X_final_normed @ W_lm_head` where `W_lm_head` has shape `(d_model, vocab_size)` or `(4, 10)`. Often, `W_lm_head` is the same as the embedding matrix (`self.token_embedding.weight`).
 
 This gives us a `(3, 10)` matrix of logits. We can then apply a softmax to the last vector (for the "ai" token) to get a probability distribution over the entire vocabulary for the next token. The token with the highest probability is our prediction.
+
+---
+
+## 6. Stacking Multiple Layers
+
+The real power of transformers comes from stacking many of these blocks (or layers) on top of each other. The process described above—from Multi-Head Attention to the MoE network—constitutes a single transformer block.
+
+A deep transformer model might have dozens of these blocks. Here’s how they connect:
+
+1.  The initial token embeddings (`X`) are fed into the **first transformer block**.
+2.  The output of this first block (`X_final_normed` in our example) becomes the **input to the second transformer block**.
+3.  This continues for all subsequent blocks. The output of block `N` is the input to block `N+1`.
+
+Each layer refines the token representations. Early layers might capture basic syntax and local word relationships, while deeper layers can build more complex, abstract semantic meanings that span the entire sequence. The residual connections (`Add & Norm`) at each step are crucial, as they allow gradients to flow more easily through this deep network during training and prevent the model from losing information from earlier layers.
+
+In `llm.py`, the `Transformer` class holds a list of these `TransformerBlock`s in `self.layers`.
+
+---
+
+## 7. Training the Model: A High-Level Overview
+
+This document has focused on the **forward pass**: how an input sequence produces a prediction. But how does the model learn to make *good* predictions? This happens during training, which involves a **backward pass**.
+
+**Step 1: Calculate the Loss**
+
+For a given input sequence like "hello world", the model predicts the next token, "ai". We compare the model's predicted probability distribution (from the final softmax) with the actual correct token. The difference between the prediction and the ground truth is quantified by a **loss function**. A common choice is **Cross-Entropy Loss**.
+
+- If the model assigns a high probability to the correct token ("ai"), the loss is low.
+- If it assigns a low probability to the correct token, the loss is high.
+
+The goal of training is to adjust the model's weights to minimize this loss across a huge dataset of text.
+
+**Step 2: Backpropagation**
+
+This is the core of the learning process. Backpropagation is an algorithm that calculates the **gradient** of the loss function with respect to every single learnable weight in the model (e.g., the matrices `W_q`, `W_k`, `W_v`, the expert FFN weights, the gain parameters in RMSNorm, etc.).
+
+A gradient tells us two things:
+- **Direction**: Which way to adjust a weight to decrease the loss.
+- **Magnitude**: How much that weight contributed to the final error.
+
+Think of it as the model figuring out the "blame" for its mistake and assigning it to each weight.
+
+**Step 3: The Optimizer**
+
+Once we have the gradients, an **optimizer** (like Adam or SGD) updates all the weights. It takes a small step in the direction opposite to the gradient, effectively nudging the millions of parameters in the model so that the next time it sees a similar input, its prediction will be slightly closer to the correct answer.
+
+This cycle of `forward pass -> calculate loss -> backpropagation -> update weights` is repeated millions or billions of times on a massive text corpus, allowing the model to gradually learn the patterns of language.
