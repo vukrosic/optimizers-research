@@ -96,19 +96,21 @@ In `llm.py`, this is done by `self.token_embedding`. The code also multiplies by
 
 ## 2. Positional Information: Rotary Positional Embeddings (RoPE)
 
-Self-attention is permutation-invariant, meaning it doesn't know the order of tokens. We need to inject positional information. RoPE does this by rotating our query and key vectors (which we'll create in the next step) based on their position.
+Self-attention is permutation-invariant, meaning it doesn't know the order of tokens. Without positional information, the sequence "hello world ai" would be treated the same as "ai hello world" or "world ai hello". We need to inject positional information so the model understands that "hello" comes first, "world" comes second, and "ai" comes third.
 
-RoPE works by viewing pairs of features in our vectors as complex numbers and rotating them. For a vector `v = [v1, v2, v3, v4]` at position `m`, we would group features into pairs `(v1, v2)` and `(v3, v4)`. Each pair is rotated by an angle that depends on the position `m`.
+RoPE (Rotary Positional Embeddings) solves this by rotating our query and key vectors based on their position in the sequence. Think of it like adding a unique "signature" to each token that encodes where it sits in the sentence.
 
-The rotation formula for a pair `(x_i, x_{i+1})` at position `m` is:
+### How RoPE Works: Step by Step
 
-\[
-\begin{pmatrix} x'_i \\ x'_{i+1} \end{pmatrix} = \begin{pmatrix} \cos(m\theta_j) & -\sin(m\theta_j) \\ \sin(m\theta_j) & \cos(m\theta_j) \end{pmatrix} \begin{pmatrix} x_i \\ x_{i+1} \end{pmatrix}
-\]
+**Step 1: Understanding the Core Idea**
 
-Where `\theta_j` is a frequency that depends on the dimension `j`.
+RoPE treats pairs of features in our vectors as if they were complex numbers on a 2D plane. Instead of adding positional encodings (like older methods), RoPE rotates the vectors themselves. The amount of rotation depends on the token's position.
 
-This happens inside the attention mechanism, after we've created Query (Q) and Key (K) vectors. We'll see this in the next section. In `llm.py`, this is handled by the `Rotary` class.
+Imagine you have a vector `v = [v1, v2, v3, v4]` at position `m`. RoPE groups the features into pairs: `(v1, v2)` and `(v3, v4)`. Each pair gets rotated by an angle that's unique to that position.
+
+**Step 2: The Rotation Mathematics**
+
+For a pair of numbers `(x, y)` at position `m`, the rotation formula is:
 
 ---
 
