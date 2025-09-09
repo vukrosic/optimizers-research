@@ -110,8 +110,94 @@ Imagine you have a vector `v = [v1, v2, v3, v4]` at position `m`. RoPE groups th
 
 **Step 2: The Rotation Mathematics**
 
-For a pair of numbers `(x, y)` at position `m`, the rotation formula is:
+For a pair of features `(x, y)` from a vector at position `m`, RoPE applies a rotation. The formula, expressed in matrix form, is:
 
+\[
+\begin{pmatrix} x' \\ y' \end{pmatrix} = \begin{pmatrix} \cos(\theta_m) & -\sin(\theta_m) \\ \sin(\theta_m) & \cos(\theta_m) \end{pmatrix} \begin{pmatrix} x \\ y \end{pmatrix}
+\]
+
+This is equivalent to:
+- `x' = x * cos(θ_m) - y * sin(θ_m)`
+- `y' = x * sin(θ_m) + y * cos(θ_m)`
+
+Where:
+- `m` is the position of the token in the sequence (e.g., 0, 1, 2...).
+- `θ_m` is the angle of rotation, which is calculated as `m * θ_i`.
+- `θ_i = 1.0 / (10000^(2i / d))`, where `i` is the index of the feature pair (0 for the first pair, 1 for the second, etc.) and `d` is the embedding dimension.
+
+This formula means that the angle of rotation is different for each pair of features and for each position, creating a unique positional signal.
+
+**Step 3: A Concrete Example**
+
+Let's apply RoPE to the query vector of "world" which is at position `m=1`.
+Assume our `d_model` is 4, and the query vector for "world" is `q_world = [0.5, 0.8, 0.2, 0.7]`.
+
+1.  **Group into pairs:**
+    - Pair 1: `(0.5, 0.8)` (`i=0`)
+    - Pair 2: `(0.2, 0.7)` (`i=1`)
+
+2.  **Calculate `θ_i` for each pair:** (`d=4`)
+    - For `i=0`: `θ_0 = 1 / (10000^(2*0 / 4)) = 1 / (10000^0) = 1.0`
+    - For `i=1`: `θ_1 = 1 / (10000^(2*1 / 4)) = 1 / (10000^0.5) = 1 / 100 = 0.01`
+
+3.  **Calculate the rotation angle `θ_m` for position `m=1`:**
+    - Angle for Pair 1: `m * θ_0 = 1 * 1.0 = 1.0` radian
+    - Angle for Pair 2: `m * θ_1 = 1 * 0.01 = 0.01` radians
+
+4.  **Rotate Pair 1 (angle = 1.0 rad):**
+    - `cos(1.0) ≈ 0.54`, `sin(1.0) ≈ 0.84`
+    - `x' = 0.5 * 0.54 - 0.8 * 0.84 = 0.27 - 0.672 = -0.402`
+    - `y' = 0.5 * 0.84 + 0.8 * 0.54 = 0.42 + 0.432 = 0.852`
+    - Rotated Pair 1: `[-0.402, 0.852]`
+
+5.  **Rotate Pair 2 (angle = 0.01 rad):**
+    - `cos(0.01) ≈ 0.99995`, `sin(0.01) ≈ 0.01`
+    - `x' = 0.2 * 0.99995 - 0.7 * 0.01 = 0.19999 - 0.007 = 0.193`
+    - `y' = 0.2 * 0.01 + 0.7 * 0.99995 = 0.002 + 0.699965 = 0.702`
+    - Rotated Pair 2: `[0.193, 0.702]`
+
+6.  **Combine the rotated pairs:**
+    The final rotated query vector for "world" is `q'_world = [-0.402, 0.852, 0.193, 0.702]`. This new vector now contains information about its content *and* its position.
+
+### Why is RoPE so effective?
+
+The magic of RoPE is that the dot product between two rotated vectors `q'_m` and `k'_n` (query at position `m` and key at position `n`) depends only on their *relative position* `m-n`, not their absolute positions. This property makes the attention scores sensitive to the distance between tokens, which is exactly what we want.
+
+### Python Code Example
+
+Here is a simplified Python implementation of RoPE, similar to what you might find in `llm.py`.
+
+```python
+import torch
+
+def apply_rotary_emb(
+    x: torch.Tensor,
+    freqs_complex: torch.Tensor
+) -> torch.Tensor:
+    """
+    Applies rotary positional embeddings to the input tensor.
+    """
+    # Reshape x for complex number representation
+    # (B, T, H, D) -> (B, T, H, D/2)
+    x_complex = x.float().reshape(*x.shape[:-1], -1, 2)
+    x_complex = torch.view_as_complex(x_complex)
+
+    # Apply rotation in the complex domain
+    # (B, T, H, D/2) * (T, D/2) -> (B, T, H, D/2)
+    x_rotated = x_complex * freqs_complex.unsqueeze(0).unsqueeze(2)
+
+    # Convert back to real numbers and reshape
+    x_out = torch.view_as_real(x_rotated).flatten(3)
+
+    return x_out.type_as(x)
+
+# Precompute the frequencies
+def precompute_theta_pos_frequencies(head_dim: int, max_seq_len: int, device: str) -> torch.Tensor:
+    theta = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    positions = torch.arange(max_seq_len, device=device)
+    freqs = torch.outer(positions, theta).float()
+    return torch.polar(torch.ones_like(freqs), freqs) # complex64
+```
 ---
 
 ## 3. Multi-Head Attention: How Tokens Talk to Each Other
