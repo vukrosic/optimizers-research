@@ -431,3 +431,69 @@ Think of it as the model figuring out the "blame" for its mistake and assigning 
 Once we have the gradients, an **optimizer** (like Adam or SGD) updates all the weights. It takes a small step in the direction opposite to the gradient, effectively nudging the millions of parameters in the model so that the next time it sees a similar input, its prediction will be slightly closer to the correct answer.
 
 This cycle of `forward pass -> calculate loss -> backpropagation -> update weights` is repeated millions or billions of times on a massive text corpus, allowing the model to gradually learn the patterns of language.
+
+---
+
+## 8. A Deep Dive into the Optimizers
+
+In `llm.py`, a hybrid optimization strategy is used. Instead of a single optimizer for all model parameters, the parameters are split into two groups, each handled by a different optimizer. This is a sophisticated approach that applies the best tool for the job.
+
+- **AdamW**: Handles the "non-matrix" parameters like embeddings, normalization gains, and any biases. These parameters are often 1D vectors or have unique structures.
+- **Muon**: A custom optimizer designed specifically for the core 2D weight matrices in the attention and feed-forward layers.
+
+### AdamW: The Dependable Workhorse
+
+AdamW is an evolution of the popular Adam optimizer. It combines two key ideas: **momentum** and **adaptive learning rates**, with an improved handling of **weight decay**.
+
+**1. Core Idea: Adaptive Learning Rates**
+Instead of using a single, fixed learning rate, AdamW adapts it for each individual parameter. It maintains two moving averages for each parameter:
+- **First Moment (the mean of the gradients)**: This is the **momentum**. It keeps track of the general direction of the gradients, helping to accelerate movement and smooth out oscillations.
+- **Second Moment (the variance of the gradients)**: This tracks how much the gradients for a parameter vary. If a parameter's gradients are all over the place (high variance), the optimizer will take smaller steps. If the gradients are consistent (low variance), it will take larger, more confident steps.
+
+**2. Key Feature: Decoupled Weight Decay**
+Weight decay is a regularization technique that prevents weights from growing too large by adding a penalty to the loss function. The original Adam optimizer mixed this decay with the adaptive learning rate, which could lead to suboptimal results.
+
+AdamW "decouples" the weight decay. Instead of modifying the gradients, it applies the decay directly to the weights *after* the main optimization step. This allows for more effective regularization.
+
+**The Math (Simplified):**
+For a weight `w` with gradient `g`:
+1. `m = beta1 * m + (1 - beta1) * g`  (Update momentum)
+2. `v = beta2 * v + (1 - beta2) * g*g`  (Update variance)
+3. `w = w - lr * m / (sqrt(v) + epsilon)` (Main update step)
+4. `w = w - lr * weight_decay * w` (Decoupled weight decay)
+
+### Muon: Orthogonalized Momentum
+
+Muon (`MomentUm Orthogonalized by Newton-schulz`) is the custom optimizer from your code. It's designed to improve upon standard momentum by ensuring the updates it makes are "well-behaved," particularly for large matrix multiplications.
+
+**1. Core Idea: Standard Momentum**
+First, Muon calculates the momentum update, just like a standard SGD with Momentum or Nesterov momentum optimizer. It maintains a `momentum_buffer` that accumulates a moving average of the past gradients.
+
+`buf = momentum * buf + (1 - momentum) * g`
+
+This `buf` (buffer) represents the smoothed, historical direction of the gradients. With Nesterov momentum, it calculates the gradient "a little ahead" in this direction, which can help the optimizer anticipate changes and converge faster.
+
+**2. Key Feature: Orthogonalization**
+This is the novel part of Muon. After calculating the momentum-infused gradient `g`, it passes it through an **orthogonalization** step:
+
+`g = zeropower_via_newtonschulz5(g)`
+
+What does this mean? Think of a matrix. If its rows (or columns) are orthogonal, they are all perpendicular to each other. They represent independent, non-redundant directions in space. In deep learning, when weight matrices have this property, training can be much more stable and efficient. The updates don't interfere with each other, and information flows more cleanly.
+
+The `zeropower_via_newtonschulz5` function is an algorithm that takes any matrix and iteratively transforms it into a matrix that is **orthogonal**, without changing its fundamental "shape" or "span."
+
+By orthogonalizing the gradient update matrix `g`, we ensure that the update applied to the model's weights is as clean and non-redundant as possible. It pushes the weights in independent directions, which can prevent the "exploding" or "vanishing" gradient problems and lead to more stable training.
+
+**3. The Final Update Step**
+
+Finally, the orthogonalized gradient `g` is used to update the parameter `p`:
+
+`p.add_(g, alpha=-lr * scale_factor)`
+
+The `scale_factor` (`max(1, rows / cols)**0.5`) is a small adjustment to account for the shape of the matrix, ensuring that wider or taller matrices are updated appropriately.
+
+**Illustrative Example: Why Orthogonalize?**
+
+Imagine you're navigating a robot with two joysticks.
+- **Standard Momentum**: You push the "forward" joystick. But due to bad wiring, it also makes the robot turn slightly right. You want to turn left, but that joystick also makes the robot slow down a bit. The controls are *coupled* and inefficient. This is like a non-orthogonal update, where changing one feature inadvertently affects another.
+- **Orthogonalized Momentum (Muon)**: You push the "forward" joystick, and the robot goes perfectly straight. You use the "turn" joystick, and it turns perfectly on the spot. The controls are *independent* and clean. This is what Muon aims for: an update where each component of the gradient influences a unique, independent aspect of the weight matrix.
