@@ -345,7 +345,7 @@ class AdvancedTransformerBlock(nn.Module):
             residual = x
             x_norm = self.norm1(x)
             
-            if hasattr(self.attention, 'forward'):
+            if isinstance(self.attention, MultiQueryAttention):
                 attn_out = self.attention(x_norm)
             else:
                 attn_mask = torch.triu(torch.ones(x.size(1), x.size(1)), diagonal=1).bool().to(x.device)
@@ -371,7 +371,7 @@ class AdvancedTransformerBlock(nn.Module):
         else:
             # Post-norm (original transformer)
             residual = x
-            if hasattr(self.attention, 'forward'):
+            if isinstance(self.attention, MultiQueryAttention):
                 attn_out = self.attention(x)
             else:
                 attn_mask = torch.triu(torch.ones(x.size(1), x.size(1)), diagonal=1).bool().to(x.device)
