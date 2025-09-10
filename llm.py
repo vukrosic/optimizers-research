@@ -678,8 +678,639 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
 
     return model, final_eval
 
+# =============================================================================
+# 🔬 ADVANCED OPTIMIZER RESEARCH FOR FASTER LLM CONVERGENCE
+# =============================================================================
+
+class SophiaG(torch.optim.Optimizer):
+    """
+    Sophia-G optimizer with Hutchinson trace estimator for diagonal Hessian approximation.
+    More efficient than full Hessian but captures curvature information for faster convergence.
+    """
+    def __init__(self, params, lr=1e-4, betas=(0.965, 0.99), rho=0.04, weight_decay=1e-1, 
+                 maximize=False, capturable=False):
+        defaults = dict(lr=lr, betas=betas, rho=rho, weight_decay=weight_decay, 
+                       maximize=maximize, capturable=capturable)
+        super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('maximize', False)
+            group.setdefault('capturable', False)
+
+    @torch.no_grad()
+    def step(self, closure=None, bs=5120):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_hessian_diag_sqs = []
+            state_steps = []
+            beta1, beta2 = group['betas']
+
+            for p in group['params']:
+                if p.grad is not None:
+                    params_with_grad.append(p)
+                    if p.grad.dtype in {torch.float16, torch.bfloat16}:
+                        grads.append(p.grad.float())
+                    else:
+                        grads.append(p.grad)
+
+                    state = self.state[p]
+                    # Lazy state initialization
+                    if len(state) == 0:
+                        state['step'] = torch.zeros((1,), dtype=torch.float, device=p.device) \
+                            if group['capturable'] else 0
+                        state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format).float()
+                        state['hessian'] = torch.zeros_like(p, memory_format=torch.preserve_format).float()
+
+                    exp_avgs.append(state['exp_avg'])
+                    exp_hessian_diag_sqs.append(state['hessian'])
+
+                    if group['capturable']:
+                        state_steps.append(state['step'])
+                    else:
+                        state_steps.append(state['step'])
+
+            sophia_update(params_with_grad,
+                         grads,
+                         exp_avgs,
+                         exp_hessian_diag_sqs,
+                         state_steps,
+                         bs=bs,
+                         beta1=beta1,
+                         beta2=beta2,
+                         rho=group['rho'],
+                         lr=group['lr'],
+                         weight_decay=group['weight_decay'],
+                         maximize=group['maximize'],
+                         capturable=group['capturable'])
+
+        return loss
+
+def sophia_update(params, grads, exp_avgs, exp_hessian_diag_sqs, state_steps,
+                  bs: int, beta1: float, beta2: float, rho: float, lr: float,
+                  weight_decay: float, maximize: bool, capturable: bool):
+    if not all(isinstance(t, torch.Tensor) for t in state_steps):
+        raise RuntimeError("API has changed, `state_steps` argument must contain a list of singleton tensors")
+
+    for i, param in enumerate(params):
+        grad = grads[i] if not maximize else -grads[i]
+        exp_avg = exp_avgs[i]
+        hut_trace = exp_hessian_diag_sqs[i]
+        step_t = state_steps[i]
+
+        if capturable:
+            assert param.device == step_t.device == exp_avg.device == hut_trace.device == grad.device
+
+        if torch.is_complex(param):
+            grad = torch.view_as_real(grad)
+            exp_avg = torch.view_as_real(exp_avg)
+            hut_trace = torch.view_as_real(hut_trace)
+            param = torch.view_as_real(param)
+
+        # update step
+        step_t += 1
+
+        # Perform stepweight decay
+        param.mul_(1 - lr * weight_decay)
+
+        # Decay the first and second moment running average coefficient
+        exp_avg.lerp_(grad, 1 - beta1)
+
+        if len(params) > 1:
+            zeta = torch.randint_like(grad, high=2, dtype=grad.dtype) * 2.0 - 1.0
+        else:
+            zeta = torch.randint_like(grad, high=2, dtype=grad.dtype) * 2.0 - 1.0
+
+        # Hutchinson trace Hessian diagonal estimate
+        h = grad * zeta
+        hut_trace.lerp_(h * h, 1 - beta2)
+
+        bias_correction1 = 1 - beta1 ** step_t.item()
+        bias_correction2 = 1 - beta2 ** step_t.item()
+
+        k = group_product(exp_avgs, exp_hessian_diag_sqs) / bs
+        u = exp_avg / bias_correction1 / (torch.sqrt(hut_trace / bias_correction2) + rho).clamp_(min=1e-15)
+        param.add_(u * k, alpha=-lr)
+
+def group_product(tensor_list, tensor_list2):
+    return sum([torch.sum(tensor1 * tensor2) for tensor1, tensor2 in zip(tensor_list, tensor_list2)])
+
+
+class Lion(torch.optim.Optimizer):
+    """
+    Lion optimizer - EvoLved Sign Momentum.
+    Uses sign of momentum for updates, which can lead to faster convergence with better generalization.
+    """
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+                
+                # State Initialization
+                if len(state) == 0:
+                    state['exp_avg'] = torch.zeros_like(p)
+
+                exp_avg = state['exp_avg']
+                beta1, beta2 = group['betas']
+
+                # Weight decay
+                if group['weight_decay'] > 0:
+                    p.add_(p, alpha=-group['weight_decay'] * group['lr'])
+
+                # Update with sign of interpolated momentum
+                update = exp_avg * beta1 + grad * (1 - beta1)
+                p.add_(torch.sign(update), alpha=-group['lr'])
+
+                # Decay the momentum running average coefficient
+                exp_avg.lerp_(grad, 1 - beta2)
+
+        return loss
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance and hard examples.
+    Reduces loss for well-classified examples and focuses on hard examples.
+    """
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    """
+    Label Smoothing Cross Entropy - prevents overconfidence and improves generalization.
+    """
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+
+    def forward(self, pred, target):
+        n_class = pred.size(1)
+        one_hot = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
+        smooth_one_hot = one_hot * (1 - self.smoothing) + self.smoothing / n_class
+        loss = torch.sum(-smooth_one_hot * F.log_softmax(pred, 1), 1)
+        return loss.mean()
+
+
+class SwishActivation(nn.Module):
+    """Swish activation: x * sigmoid(x) - often better than ReLU for deep networks"""
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
+class GeGLU(nn.Module):
+    """Gated Linear Unit with GELU activation - improves information flow"""
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out * 2)
+
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * F.gelu(gate)
+
+
+class AdaptiveBatchSizeTrainer:
+    """
+    Adaptive batch size training - automatically adjusts batch size based on gradient variance.
+    """
+    def __init__(self, initial_batch_size=32, min_batch_size=8, max_batch_size=128):
+        self.batch_size = initial_batch_size
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.grad_var_history = []
+        self.adjustment_threshold = 0.1
+
+    def should_increase_batch_size(self, grad_variance):
+        if len(self.grad_var_history) < 10:
+            self.grad_var_history.append(grad_variance)
+            return False
+        
+        recent_variance = np.mean(self.grad_var_history[-10:])
+        if grad_variance < recent_variance * (1 - self.adjustment_threshold):
+            return True
+        return False
+
+    def should_decrease_batch_size(self, grad_variance):
+        if len(self.grad_var_history) < 10:
+            return False
+        
+        recent_variance = np.mean(self.grad_var_history[-10:])
+        if grad_variance > recent_variance * (1 + self.adjustment_threshold):
+            return True
+        return False
+
+    def update_batch_size(self, grad_variance):
+        self.grad_var_history.append(grad_variance)
+        
+        if self.should_increase_batch_size(grad_variance) and self.batch_size < self.max_batch_size:
+            self.batch_size = min(self.batch_size * 2, self.max_batch_size)
+            print(f"📈 Increased batch size to {self.batch_size}")
+        elif self.should_decrease_batch_size(grad_variance) and self.batch_size > self.min_batch_size:
+            self.batch_size = max(self.batch_size // 2, self.min_batch_size)
+            print(f"📉 Decreased batch size to {self.batch_size}")
+
+
+@dataclass
+class AdvancedMoEModelConfig(MoEModelConfig):
+    """Extended configuration with advanced training techniques"""
+    # Optimizer selection
+    optimizer_type: str = "muon"  # "muon", "sophia", "lion", "adamw"
+    
+    # Loss function improvements
+    use_focal_loss: bool = False
+    focal_alpha: float = 1.0
+    focal_gamma: float = 2.0
+    use_label_smoothing: bool = True
+    label_smoothing: float = 0.1
+    
+    # Architecture improvements  
+    use_swish_activation: bool = True
+    use_geglu: bool = True
+    
+    # Training dynamics
+    use_adaptive_batch_size: bool = False
+    use_cosine_restarts: bool = True
+    restart_cycles: int = 3
+    
+    # Advanced regularization
+    dropout_attention: float = 0.1
+    dropout_feedforward: float = 0.1
+    stochastic_depth_rate: float = 0.1
+    
+    # Learning rate scheduling
+    use_polynomial_decay: bool = False
+    polynomial_power: float = 1.0
+    
+    # Gradient analysis
+    track_gradient_norms: bool = True
+    gradient_norm_clip: float = 1.0
+
+
+class ExperimentTracker:
+    """Track experiments and compare different approaches"""
+    def __init__(self):
+        self.experiments = []
+        self.current_experiment = None
+
+    def start_experiment(self, name, config):
+        self.current_experiment = {
+            'name': name,
+            'config': config,
+            'metrics': [],
+            'start_time': time.time(),
+            'gradient_norms': [],
+            'learning_rates': []
+        }
+
+    def log_metrics(self, step, loss, accuracy, lr=None, grad_norm=None):
+        if self.current_experiment:
+            self.current_experiment['metrics'].append({
+                'step': step,
+                'loss': loss,
+                'accuracy': accuracy,
+                'timestamp': time.time()
+            })
+            if lr is not None:
+                self.current_experiment['learning_rates'].append(lr)
+            if grad_norm is not None:
+                self.current_experiment['gradient_norms'].append(grad_norm)
+
+    def end_experiment(self, final_metrics):
+        if self.current_experiment:
+            self.current_experiment['end_time'] = time.time()
+            self.current_experiment['duration'] = (
+                self.current_experiment['end_time'] - self.current_experiment['start_time']
+            )
+            self.current_experiment['final_metrics'] = final_metrics
+            self.experiments.append(self.current_experiment)
+            self.current_experiment = None
+
+    def compare_experiments(self):
+        """Compare all experiments and return best performing one"""
+        if not self.experiments:
+            return None
+        
+        best_exp = min(self.experiments, key=lambda x: x['final_metrics']['val_loss'])
+        print(f"\n🏆 EXPERIMENT COMPARISON:")
+        print(f"{'='*80}")
+        for i, exp in enumerate(self.experiments):
+            status = "🥇 BEST" if exp == best_exp else f"#{i+1}"
+            print(f"{status} {exp['name']}")
+            print(f"   Final Loss: {exp['final_metrics']['val_loss']:.4f}")
+            print(f"   Final Accuracy: {exp['final_metrics']['val_accuracy']:.4f}")
+            print(f"   Training Time: {exp['duration']/60:.1f} min")
+            print(f"   Optimizer: {exp['config'].optimizer_type}")
+            print()
+        
+        return best_exp
+
+
+def setup_advanced_optimizer(model: nn.Module, config: AdvancedMoEModelConfig):
+    """Setup advanced optimizers based on configuration"""
+    
+    # Separate parameters for different optimizers
+    matrix_params = []
+    other_params = []
+    
+    for name, param in model.named_parameters():
+        if (param.ndim == 2 and 
+            'token_embedding' not in name and 
+            'norm' not in name and 
+            param.requires_grad):
+            matrix_params.append(param)
+        else:
+            other_params.append(param)
+    
+    print(f"  Matrix parameters: {sum(p.numel() for p in matrix_params):,}")
+    print(f"  Other parameters: {sum(p.numel() for p in other_params):,}")
+    
+    optimizers = []
+    
+    if config.optimizer_type == "sophia":
+        if matrix_params:
+            optimizers.append(SophiaG(matrix_params, lr=config.muon_lr, weight_decay=config.weight_decay))
+        if other_params:
+            optimizers.append(torch.optim.AdamW(other_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay))
+    
+    elif config.optimizer_type == "lion":
+        if matrix_params:
+            optimizers.append(Lion(matrix_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay))
+        if other_params:
+            optimizers.append(torch.optim.AdamW(other_params, lr=config.muon_lr*0.01, weight_decay=config.weight_decay))
+    
+    elif config.optimizer_type == "muon":
+        if matrix_params:
+            optimizers.append(Muon(matrix_params, lr=config.muon_lr, momentum=0.95))
+        if other_params:
+            optimizers.append(torch.optim.AdamW(other_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay))
+    
+    else:  # adamw
+        all_params = matrix_params + other_params
+        optimizers.append(torch.optim.AdamW(all_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay))
+    
+    return optimizers
+
+
+def setup_advanced_scheduler(optimizers, config: AdvancedMoEModelConfig):
+    """Setup advanced learning rate schedulers"""
+    schedulers = []
+    
+    for optimizer in optimizers:
+        if config.use_cosine_restarts:
+            # Cosine annealing with warm restarts
+            T_0 = config.max_steps // config.restart_cycles
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=T_0, T_mult=1, eta_min=config.muon_lr * 0.01
+            )
+        elif config.use_polynomial_decay:
+            # Polynomial decay
+            scheduler = torch.optim.lr_scheduler.PolynomialLR(
+                optimizer, total_iters=config.max_steps, power=config.polynomial_power
+            )
+        else:
+            # Standard cosine with warmup
+            warmup_steps = config.max_steps // 20
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return step / warmup_steps
+                else:
+                    progress = (step - warmup_steps) / (config.max_steps - warmup_steps)
+                    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+            
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        
+        schedulers.append(scheduler)
+    
+    return schedulers
+
+
+def get_advanced_loss_function(config: AdvancedMoEModelConfig):
+    """Get advanced loss function based on configuration"""
+    if config.use_focal_loss:
+        return FocalLoss(alpha=config.focal_alpha, gamma=config.focal_gamma)
+    elif config.use_label_smoothing:
+        return LabelSmoothingCrossEntropy(smoothing=config.label_smoothing)
+    else:
+        return F.cross_entropy
+
+
+def calculate_gradient_norm(model):
+    """Calculate the norm of gradients for monitoring training dynamics"""
+    total_norm = 0
+    param_count = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+            param_count += 1
+    return (total_norm ** 0.5) / max(param_count, 1)
+
+
+def train_advanced_moe_model(config: AdvancedMoEModelConfig, train_loader: DataLoader, 
+                           val_loader: DataLoader, experiment_tracker: ExperimentTracker):
+    """Advanced training with multiple optimization techniques"""
+    experiment_name = f"Advanced_{config.optimizer_type}_{config.use_focal_loss}_{config.use_label_smoothing}"
+    experiment_tracker.start_experiment(experiment_name, config)
+    
+    print(f"\n🚀 Training Advanced MoE model")
+    print(f"   Optimizer: {config.optimizer_type}")
+    print(f"   Loss function: {'Focal' if config.use_focal_loss else 'Label Smoothed' if config.use_label_smoothing else 'Standard'}")
+    print(f"   Architecture: {'SwishGEGLU' if config.use_swish_activation and config.use_geglu else 'Standard'}")
+
+    # Initialize model with advanced features
+    set_seed(42)
+    model = AdvancedMoEMinimalLLM(config)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
+    # Setup advanced optimizers and schedulers
+    optimizers = setup_advanced_optimizer(model, config)
+    schedulers = setup_advanced_scheduler(optimizers, config)
+    
+    # Setup advanced loss function
+    loss_fn = get_advanced_loss_function(config)
+    
+    # Adaptive batch size trainer
+    adaptive_trainer = AdaptiveBatchSizeTrainer() if config.use_adaptive_batch_size else None
+    
+    scaler = GradScaler() if config.use_amp else None
+
+    # Training loop
+    model.train()
+    step = 0
+    best_val_loss = float('inf')
+    pbar = tqdm(total=config.max_steps, desc=f"Training {config.optimizer_type}")
+
+    while step < config.max_steps:
+        for batch_idx, (x, y) in enumerate(train_loader):
+            if step >= config.max_steps:
+                break
+
+            x, y = x.to(device), y.to(device)
+
+            # Forward pass
+            if config.use_amp:
+                with autocast():
+                    logits, aux_loss = model(x, return_aux_loss=True)
+                    
+                    # Advanced loss calculation
+                    if config.use_focal_loss or config.use_label_smoothing:
+                        ce_loss = loss_fn(logits.view(-1, config.vocab_size), y.view(-1))
+                    else:
+                        ce_loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+
+                    total_loss = ce_loss
+                    if aux_loss is not None:
+                        total_loss = total_loss + aux_loss
+
+                    loss = total_loss / config.gradient_accumulation_steps
+                scaler.scale(loss).backward()
+            else:
+                logits, aux_loss = model(x, return_aux_loss=True)
+                
+                if config.use_focal_loss or config.use_label_smoothing:
+                    ce_loss = loss_fn(logits.view(-1, config.vocab_size), y.view(-1))
+                else:
+                    ce_loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+
+                total_loss = ce_loss
+                if aux_loss is not None:
+                    total_loss = total_loss + aux_loss
+
+                loss = total_loss / config.gradient_accumulation_steps
+                loss.backward()
+
+            # Optimizer step
+            if (step + 1) % config.gradient_accumulation_steps == 0:
+                # Calculate gradient norm for tracking
+                grad_norm = calculate_gradient_norm(model) if config.track_gradient_norms else None
+                
+                if config.use_amp:
+                    for optimizer in optimizers:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_norm_clip)
+
+                    for optimizer in optimizers:
+                        scaler.step(optimizer)
+                        optimizer.zero_grad()
+                    for scheduler in schedulers:
+                        scheduler.step()
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_norm_clip)
+                    for optimizer in optimizers:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    for scheduler in schedulers:
+                        scheduler.step()
+
+                # Adaptive batch size adjustment
+                if adaptive_trainer and grad_norm:
+                    adaptive_trainer.update_batch_size(grad_norm)
+
+            # Logging and tracking
+            if step % 100 == 0:
+                with torch.no_grad():
+                    predictions = logits.argmax(dim=-1)
+                    accuracy = (predictions == y).float().mean().item()
+                    current_loss = ce_loss.item()
+                    perplexity = math.exp(min(current_loss, 20))
+                    
+                    # Get current learning rate
+                    current_lr = optimizers[0].param_groups[0]['lr']
+                    
+                    experiment_tracker.log_metrics(
+                        step, current_loss, accuracy, current_lr, grad_norm
+                    )
+
+                pbar.set_postfix({
+                    'loss': f'{current_loss:.4f}',
+                    'acc': f'{accuracy:.3f}',
+                    'ppl': f'{perplexity:.1f}',
+                    'lr': f'{current_lr:.2e}',
+                    'opt': config.optimizer_type
+                })
+
+            # Evaluation
+            if step % config.eval_every == 0 and step > 0:
+                eval_metrics = evaluate_model(model, val_loader, config)
+                print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
+                      f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
+                      f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
+                
+                if eval_metrics['val_loss'] < best_val_loss:
+                    best_val_loss = eval_metrics['val_loss']
+                    print(f"🎯 New best validation loss: {best_val_loss:.4f}")
+
+            step += 1
+            if step % 100 == 0:
+                pbar.update(100)
+
+    pbar.close()
+
+    # Final evaluation
+    final_eval = evaluate_model(model, val_loader, config)
+    experiment_tracker.end_experiment(final_eval)
+    
+    return model, final_eval
+
+
+class AdvancedMoEMinimalLLM(MoEMinimalLLM):
+    """Advanced MoE model with architectural improvements"""
+    def __init__(self, config: AdvancedMoEModelConfig):
+        # Temporarily modify config for parent class
+        super().__init__(config)
+        self.config = config
+        
+        # Replace feedforward layers with advanced versions if specified
+        if config.use_geglu:
+            for block in self.transformer_blocks:
+                # Replace experts with GeGLU versions
+                for expert in block.feed_forward.experts:
+                    expert.linear1 = GeGLU(config.d_model, config.d_ff)
+
+
+# Run comprehensive experiments
 if __name__ == "__main__":
-    # Check system
+    print(f"🔬 ADVANCED LLM TRAINING RESEARCH")
+    print(f"{'='*80}")
     print(f"🔍 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name()}")
@@ -688,63 +1319,83 @@ if __name__ == "__main__":
     # Set seed
     set_seed(42)
 
-    # Load data first to get vocab_size
-    temp_config = MoEModelConfig()  # Use MoE config for data loading
+    # Load data
+    temp_config = MoEModelConfig()
     texts, tokenizer, tokens = load_and_cache_data(temp_config)
     vocab_size = temp_config.vocab_size
 
-    # Test MoE model
-    config = MoEModelConfig(
-        # Base model parameters
-        d_model=384,
-        n_heads=8,
-        n_layers=6,
-        d_ff=1536,
-        batch_size=24,
-        max_steps=1000,
-        eval_every=10000000,
-        vocab_size=vocab_size,
-
-        # MoE specific
-        num_experts=8,
-        expert_top_k=2,
-        load_balancing_weight=0.01
-    )
-
     dataset = TextTokenDataset(tokens, temp_config.max_seq_len)
-
-    # Train/val split
     val_size = len(dataset) // 10
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = torch.utils.data.random_split(
         dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=temp_config.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=temp_config.batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=24, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False, num_workers=2)
 
-    print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
+    # Initialize experiment tracker
+    tracker = ExperimentTracker()
 
-    # Train MoE model
-    print(f"\n{'='*60}")
-    print(f"🧪 TRAINING: Mixture of Experts Model")
-    print(f"{'='*60}")
+    # Define experiments to run
+    experiments = [
+        # Baseline with Muon
+        AdvancedMoEModelConfig(
+            d_model=384, n_heads=8, n_layers=6, d_ff=1536, batch_size=24,
+            max_steps=500, eval_every=10000, vocab_size=vocab_size,
+            num_experts=8, expert_top_k=2, load_balancing_weight=0.01,
+            optimizer_type="muon", use_focal_loss=False, use_label_smoothing=False
+        ),
+        
+        # Sophia optimizer
+        AdvancedMoEModelConfig(
+            d_model=384, n_heads=8, n_layers=6, d_ff=1536, batch_size=24,
+            max_steps=500, eval_every=10000, vocab_size=vocab_size,
+            num_experts=8, expert_top_k=2, load_balancing_weight=0.01,
+            optimizer_type="sophia", use_focal_loss=False, use_label_smoothing=True
+        ),
+        
+        # Lion optimizer with focal loss
+        AdvancedMoEModelConfig(
+            d_model=384, n_heads=8, n_layers=6, d_ff=1536, batch_size=24,
+            max_steps=500, eval_every=10000, vocab_size=vocab_size,
+            num_experts=8, expert_top_k=2, load_balancing_weight=0.01,
+            optimizer_type="lion", use_focal_loss=True, use_label_smoothing=False,
+            focal_alpha=1.0, focal_gamma=2.0
+        ),
+        
+        # Advanced architecture + Muon
+        AdvancedMoEModelConfig(
+            d_model=384, n_heads=8, n_layers=6, d_ff=1536, batch_size=24,
+            max_steps=500, eval_every=10000, vocab_size=vocab_size,
+            num_experts=8, expert_top_k=2, load_balancing_weight=0.01,
+            optimizer_type="muon", use_focal_loss=False, use_label_smoothing=True,
+            use_swish_activation=True, use_geglu=True, use_cosine_restarts=True
+        )
+    ]
 
-    print(f"\n📋 MoE Model Configuration:")
-    print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
-    print(f"   MoE: {config.num_experts} experts, top-{config.expert_top_k} routing")
-    print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
-    print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
+    # Run experiments
+    for i, config in enumerate(experiments):
+        print(f"\n🧪 EXPERIMENT {i+1}/{len(experiments)}: {config.optimizer_type.upper()}")
+        print(f"{'='*60}")
+        
+        start_time = time.time()
+        model, final_metrics = train_advanced_moe_model(config, train_loader, val_loader, tracker)
+        total_time = time.time() - start_time
+        
+        print(f"\n📊 Experiment {i+1} Results:")
+        print(f"   Training time: {total_time/60:.1f} minutes")
+        print(f"   Final Loss: {final_metrics['val_loss']:.4f}")
+        print(f"   Final Accuracy: {final_metrics['val_accuracy']:.4f}")
+        print(f"   Final Perplexity: {final_metrics['val_perplexity']:.2f}")
 
-    # Train model
-    start_time = time.time()
-    model, final_metrics = train_moe_model(config, train_loader, val_loader)
-    total_time = time.time() - start_time
-
-    print(f"\n🎯 MoE Model Results:")
-    print(f"⏱️ Training time: {total_time/60:.1f} minutes")
-    print(f"🏆 Final Results:")
-    print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
-    print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
-    print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
-    print(f"{'='*60}")
+    # Compare all experiments
+    best_experiment = tracker.compare_experiments()
+    
+    print(f"\n🎯 RESEARCH CONCLUSION:")
+    print(f"{'='*80}")
+    print(f"Best approach: {best_experiment['name']}")
+    print(f"Achieved validation loss: {best_experiment['final_metrics']['val_loss']:.4f}")
+    print(f"Training time: {best_experiment['duration']/60:.1f} minutes")
+    print(f"Recommended optimizer: {best_experiment['config'].optimizer_type}")
+    print(f"{'='*80}")
