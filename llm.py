@@ -1176,6 +1176,7 @@ def train_advanced_moe_model(config: AdvancedMoEModelConfig, train_loader: DataL
     model.train()
     step = 0
     best_val_loss = float('inf')
+    grad_norm = None  # Initialize gradient norm variable
     pbar = tqdm(total=config.max_steps, desc=f"Training {config.optimizer_type}")
 
     while step < config.max_steps:
@@ -1242,7 +1243,7 @@ def train_advanced_moe_model(config: AdvancedMoEModelConfig, train_loader: DataL
                         scheduler.step()
 
                 # Adaptive batch size adjustment
-                if adaptive_trainer and grad_norm:
+                if adaptive_trainer and grad_norm is not None:
                     adaptive_trainer.update_batch_size(grad_norm)
 
             # Logging and tracking
@@ -1255,6 +1256,11 @@ def train_advanced_moe_model(config: AdvancedMoEModelConfig, train_loader: DataL
                     
                     # Get current learning rate
                     current_lr = optimizers[0].param_groups[0]['lr']
+                    
+                    # Use the gradient norm calculated during optimizer step
+                    # or calculate it now if tracking is enabled and not already done
+                    if config.track_gradient_norms and grad_norm is None:
+                        grad_norm = calculate_gradient_norm(model)
                     
                     experiment_tracker.log_metrics(
                         step, current_loss, accuracy, current_lr, grad_norm
