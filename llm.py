@@ -14,10 +14,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import warnings
 import os
+import sys
 import pickle
 from torchtune.modules import RotaryPositionalEmbeddings
-import sys
-sys.path.append('./Muon')
+sys.path.append(os.path.join(os.path.dirname(__file__), 'Muon'))
 from muon import SingleDeviceMuon, MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 warnings.filterwarnings('ignore')
 
