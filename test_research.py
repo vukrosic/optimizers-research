@@ -210,8 +210,24 @@ class LabelSmoothingCrossEntropy(nn.Module):
         return loss.mean()
 
 # Simple transformer model for testing
+class StochasticDepth(nn.Module):
+    """Stochastic Depth - randomly drop entire transformer blocks"""
+    def __init__(self, drop_prob: float):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x, residual):
+        if not self.training:
+            return x + residual
+        
+        # Randomly drop the block output
+        if random.random() < self.drop_prob:
+            return residual  # Skip the block entirely
+        else:
+            return x + residual
+
 class SimpleTransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, stochastic_depth=0.0):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.feed_forward = nn.Sequential(
@@ -224,16 +240,21 @@ class SimpleTransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        self.stochastic_depth = StochasticDepth(stochastic_depth)
 
     def forward(self, x):
-        # Self-attention
+        # Self-attention with stochastic depth
         attn_mask = torch.triu(torch.ones(x.size(1), x.size(1)), diagonal=1).bool().to(x.device)
         attn_out, _ = self.self_attn(x, x, x, attn_mask=attn_mask)
-        x = self.norm1(x + self.dropout(attn_out))
+        attn_out = self.dropout(attn_out)
+        x = self.stochastic_depth(attn_out, x)
+        x = self.norm1(x)
         
-        # Feed-forward
+        # Feed-forward with stochastic depth
+        residual = x
         ff_out = self.feed_forward(x)
-        x = self.norm2(x + ff_out)
+        x = self.stochastic_depth(ff_out, residual)
+        x = self.norm2(x)
         return x
 
 class SimpleTransformerLM(nn.Module):
@@ -244,9 +265,12 @@ class SimpleTransformerLM(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_embedding = nn.Embedding(config.max_seq_len, config.d_model)
         
+        # Add stochastic depth with linear scaling
+        stoch_depth_rates = [x * 0.1 for x in range(config.n_layers)]  # 0, 0.1, 0.2, etc.
+        
         self.transformer_blocks = nn.ModuleList([
-            SimpleTransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout)
-            for _ in range(config.n_layers)
+            SimpleTransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout, stoch_depth_rates[i])
+            for i in range(config.n_layers)
         ])
         
         self.norm = nn.LayerNorm(config.d_model)
@@ -303,7 +327,7 @@ def setup_optimizer(model, config: TestModelConfig):
     print(f"  Matrix parameters: {sum(p.numel() for p in matrix_params):,}")
     print(f"  Other parameters: {sum(p.numel() for p in other_params):,}")
     
-    if config.optimizer_type == "muon":
+    if config.optimizer_type == "muon" or config.optimizer_type == "muon_advanced":
         if matrix_params:
             matrix_opt = Muon(matrix_params, lr=config.base_lr, momentum=0.95)
         if other_params:
@@ -559,6 +583,15 @@ def run_optimization_research():
             focal_gamma=2.0,
             use_label_smoothing=False,
             max_steps=500
+        ),
+        
+        # Advanced: Muon + Label Smoothing + Stochastic Depth (built into model now)
+        TestModelConfig(
+            optimizer_type="muon_advanced",  # Special name to trigger advanced message
+            use_focal_loss=False,
+            use_label_smoothing=True,
+            label_smoothing=0.1,
+            max_steps=500
         )
     ]
     
@@ -572,6 +605,8 @@ def run_optimization_research():
             exp_name += "_smooth"
         
         print(f"\n🧪 EXPERIMENT {i+1}/{len(experiments)}: {exp_name.upper()}")
+        if "advanced" in config.optimizer_type:
+            print(f"   🚀 ADVANCED: Includes Stochastic Depth regularization")
         print(f"{'='*60}")
         
         result = train_model(config, train_loader, val_loader)
