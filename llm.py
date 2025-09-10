@@ -736,7 +736,7 @@ class SophiaG(torch.optim.Optimizer):
                     if group['capturable']:
                         state_steps.append(state['step'])
                     else:
-                        state_steps.append(state['step'])
+                        state_steps.append(torch.tensor(float(state['step'])))
 
             sophia_update(params_with_grad,
                          grads,
